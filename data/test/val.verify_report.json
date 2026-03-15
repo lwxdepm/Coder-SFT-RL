@@ -1,0 +1,26 @@
+{
+  "total": 1,
+  "status_counts": {
+    "pass": 1
+  },
+  "kept": 1,
+  "filter_status": [
+    "pass",
+    "no_solution",
+    "ls"
+  ],
+  "results": [
+    {
+      "id": "rlvr_python_0",
+      "status": "pass",
+      "pass_rate": 1.0,
+      "stable": true,
+      "pass_rates": [
+        1.0,
+        1.0,
+        1.0,
+        1.0
+      ]
+    }
+  ]
+}

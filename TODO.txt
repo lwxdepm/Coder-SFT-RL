@@ -1,0 +1,9 @@
+DONE:
+1.SANDBOX 
+1. 数据的构建 verify
+
+TODO:
+comparision between before and after RL
+reward
+训练 
+eval

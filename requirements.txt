@@ -1,0 +1,29 @@
+# Core
+torch>=2.1.0
+transformers>=4.40.0
+vllm==0.7.3
+flash-attn
+
+# verl
+verl @ git+https://github.com/volcengine/verl.git
+
+# Sandbox
+firejail  # system install required
+
+# Data
+datasets>=2.18.0
+huggingface_hub
+
+# Observability
+wandb
+rich
+tensorboard
+
+# Utilities
+numpy
+pandas
+matplotlib
+seaborn
+tqdm
+pydantic
+python-Levenshtein>=0.25.0
