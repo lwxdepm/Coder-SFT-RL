@@ -34,6 +34,21 @@ def _execute_single_pair(args):
         return {'status': 'error', 'message': f'Executor error: {str(e)}'}
 
 
+def _create_default_result():
+    """
+    创建默认的结果字典，确保所有键都存在
+    这样可以避免 VERL 在收集结果时出现 KeyError
+    """
+    return {
+        'score': 0.0,
+        'pass_rate': 0.0,
+        'passed': 0.0,
+        'total': 0.0,
+        'acc': 0.0,
+        'syntax_valid': False,
+    }
+
+
 class CodeRewardManager:
     """代码执行 Reward Manager - 支持并行批量执行"""
 
@@ -65,7 +80,9 @@ class CodeRewardManager:
     def compute_reward(self, code: str, tests: list) -> dict:
         """计算单个代码的奖励（串行版本）"""
         if not code or not tests:
-            return {'reward': 0.0, 'passed': 0, 'total': len(tests) if tests else 0}
+            result = _create_default_result()
+            result['total'] = float(len(tests) if tests else 0)
+            return result
         
         results = []
         passed = 0
@@ -81,7 +98,15 @@ class CodeRewardManager:
                 results.append({'status': 'error'})
         
         pass_rate = calculate_pass_rate(results)
-        return {'reward': pass_rate, 'passed': passed, 'total': total}
+        
+        result = _create_default_result()
+        result.update({
+            'score': pass_rate,
+            'pass_rate': pass_rate,
+            'passed': float(passed),
+            'total': float(total),
+        })
+        return result
     
     def compute_reward_batch_parallel(
         self, 
@@ -130,11 +155,9 @@ class CodeRewardManager:
             code = codes[idx]
             
             if not code or not tests:
-                results.append({
-                    'reward': 0.0, 
-                    'passed': 0, 
-                    'total': len(tests) if tests else 0
-                })
+                result = _create_default_result()
+                result['total'] = float(len(tests) if tests else 0)
+                results.append(result)
                 continue
             
             # 找到属于这个样本的所有结果
@@ -151,11 +174,14 @@ class CodeRewardManager:
             total = len(tests)
             pass_rate = calculate_pass_rate(sample_results)
             
-            results.append({
-                'reward': pass_rate,
-                'passed': passed,
-                'total': total
+            result = _create_default_result()
+            result.update({
+                'score': pass_rate,
+                'pass_rate': pass_rate,
+                'passed': float(passed),
+                'total': float(total),
             })
+            results.append(result)
         
         return results
     
@@ -250,17 +276,17 @@ def compute_score(data_source=None, solution_str=None, ground_truth=None,
     """
     VERL 单样本接口
     
-    必须返回包含 'reward' 键的字典！
+    ⚠️ 必须返回包含统一键的字典！
     """
     # 处理空输入
     if not solution_str or not solution_str.strip():
-        return {'reward': 0.0}
+        return _create_default_result()
 
     manager = get_reward_manager()
     code = manager.extract_code(solution_str)
 
     if not code.strip():
-        return {'reward': 0.0}
+        return _create_default_result()
 
     # 检查语法
     try:
@@ -274,16 +300,18 @@ def compute_score(data_source=None, solution_str=None, ground_truth=None,
     if not tests:
         # 没有测试用例时的奖励
         reward = 0.1 if syntax_valid else -0.5
-        return {
-            'reward': reward,
-            'syntax_valid': syntax_valid
-        }
+        result = _create_default_result()
+        result.update({
+            'score': reward,
+            'syntax_valid': syntax_valid,
+        })
+        return result
 
     # 使用 sandbox 执行
-    result = manager.compute_reward(code, tests)
+    exec_result = manager.compute_reward(code, tests)
 
-    passed = result['passed']
-    total = result['total']
+    passed = int(exec_result['passed'])
+    total = int(exec_result['total'])
     pass_rate = passed / total if total > 0 else 0.0
     
     # 计算最终奖励：范围 [-0.5, 1.0]
@@ -292,17 +320,19 @@ def compute_score(data_source=None, solution_str=None, ground_truth=None,
 
     # 偶尔打印日志
     if random.randint(1, 20) == 1:
-        print(f"[REWARD] reward={reward:.2f} pass={passed}/{total} syntax={syntax_valid}")
+        print(f"[REWARD] score={reward:.2f} pass={passed}/{total} syntax={syntax_valid}")
 
-    # 返回格式：必须包含 'reward' 键！
-    return {
-        'score': reward,           # ← 这是最重要的！
+    # 返回格式：必须包含所有必需的键！
+    result = _create_default_result()
+    result.update({
+        'score': reward,
         'pass_rate': pass_rate,
-        'passed': passed,
-        'total': total,
+        'passed': float(passed),
+        'total': float(total),
         'acc': acc,
-        'syntax_valid': syntax_valid
-    }
+        'syntax_valid': syntax_valid,
+    })
+    return result
 
 
 def compute_score_batch(batch_data, use_parallel: bool = True):
@@ -315,7 +345,7 @@ def compute_score_batch(batch_data, use_parallel: bool = True):
             - Dict: 其他格式
     
     Returns:
-        List[Dict]: 每个元素必须包含 'reward' 键
+        List[Dict]: 每个元素必须包含统一的键
     """
     # 调试：查看输入格式
     if random.randint(1, 50) == 1:
@@ -376,8 +406,6 @@ def compute_score_batch(batch_data, use_parallel: bool = True):
             metadata.append({
                 'has_code': False,
                 'syntax_valid': False,
-                'response_length': 0,
-                'code_length': 0
             })
             continue
         
@@ -389,8 +417,6 @@ def compute_score_batch(batch_data, use_parallel: bool = True):
             metadata.append({
                 'has_code': False,
                 'syntax_valid': False,
-                'response_length': len(solution_str),
-                'code_length': 0
             })
             continue
         
@@ -408,49 +434,56 @@ def compute_score_batch(batch_data, use_parallel: bool = True):
         metadata.append({
             'has_code': True,
             'syntax_valid': syntax_valid,
-            'response_length': len(solution_str),
-            'code_length': len(code)
         })
     
     # 批量执行
     exec_results = manager.compute_reward_batch(codes, all_tests, use_parallel=use_parallel)
     
-    # 组装最终结果
+    # 组装最终结果 - 确保所有结果都有相同的键
     results = []
     for idx, (meta, exec_result) in enumerate(zip(metadata, exec_results)):
+        result = _create_default_result()  # 从默认值开始
+        
         if not meta['has_code']:
-            results.append({'reward': 0.0})
+            # 没有代码，使用默认值
+            results.append(result)
             continue
         
         tests = all_tests[idx]
         
         if not tests:
+            # 没有测试用例
             reward = 0.1 if meta['syntax_valid'] else -0.5
-            results.append({
-                'reward': reward,
-                'syntax_valid': meta['syntax_valid']
+            result.update({
+                'score': reward,
+                'syntax_valid': meta['syntax_valid'],
             })
+            results.append(result)
             continue
         
-        passed = exec_result['passed']
-        total = exec_result['total']
+        # 有测试结果
+        passed = int(exec_result['passed'])
+        total = int(exec_result['total'])
         pass_rate = passed / total if total > 0 else 0.0
         reward = pass_rate * 1.5 - 0.5
         acc = 1.0 if passed == total and total > 0 else 0.0
         
-        results.append({
-            'score': reward,           # ← 最重要的字段
+        result.update({
+            'score': reward,
             'pass_rate': pass_rate,
-            'passed': passed,
-            'total': total,
+            'passed': float(passed),
+            'total': float(total),
             'acc': acc,
-            'syntax_valid': meta['syntax_valid']
+            'syntax_valid': meta['syntax_valid'],
         })
+        results.append(result)
     
     # 打印统计
     if results and random.randint(1, 10) == 1:
-        avg_reward = sum(r['reward'] for r in results) / len(results)
-        print(f"[REWARD BATCH] Processed {len(results)} samples, avg reward: {avg_reward:.3f}")
+        avg_score = sum(r['score'] for r in results) / len(results)
+        avg_pass_rate = sum(r['pass_rate'] for r in results) / len(results)
+        print(f"[REWARD BATCH] Samples: {len(results)}, "
+              f"Avg score: {avg_score:.3f}, Avg pass_rate: {avg_pass_rate:.3f}")
     
     return results
 

@@ -2,7 +2,8 @@
 # Edit at https://www.toptal.com/developers/gitignore?templates=linux,vs,python
 
 wandb
-
+checkpoints
+exported_models
 ### Linux ###
 *~
 
