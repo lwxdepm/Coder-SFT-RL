@@ -1,100 +1,124 @@
 import os
 import torch
+import matplotlib.pyplot as plt  # ✨ 新增：用于绘图
 from datasets import load_dataset
 from transformers import AutoModelForCausalLM, AutoTokenizer
 from trl import SFTTrainer, SFTConfig
+from peft import LoraConfig, TaskType
 
 def main():
     # ==========================================
     # 1. 路径与基础配置
     # ==========================================
     model_path = "/root/autodl-tmp/My_Xcoder/models/Qwen_models/Qwen2.5-Coder-1.5B"
-    train_data_path = "/root/autodl-tmp/My_Xcoder/data/sft/train.jsonl"
-    val_data_path = "/root/autodl-tmp/My_Xcoder/data/sft/val.jsonl"
-    output_dir = "saves/qwen1.5b_native_full"
+    train_data_path = "/root/autodl-tmp/My_Xcoder/data/sft-kodcode/train.jsonl"
+    val_data_path = "/root/autodl-tmp/My_Xcoder/data/sft-kodcode/val.jsonl"
+    output_dir = "saves/qwen1.5b_lora_with_loss"
+    plot_path = os.path.join(output_dir, "loss_curve.png") # Loss 图保存路径
+
+    # 确保输出目录存在
+    os.makedirs(output_dir, exist_ok=True)
 
     print("🚀 正在加载 Tokenizer 与 Dataset...")
-    
-    # ==========================================
-    # 2. 加载数据与 Tokenizer
-    # ==========================================
     tokenizer = AutoTokenizer.from_pretrained(model_path)
-    # Qwen 等很多模型没有默认的 pad_token，通常用 eos_token 替代
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
 
-    dataset = load_dataset(
-        "json", 
-        data_files={"train": train_data_path, "test": val_data_path}
-    )
+    dataset = load_dataset("json", data_files={"train": train_data_path, "test": val_data_path})
 
     # ==========================================
-    # 3. 加载模型 (注入 4090 性能黑科技)
+    # 2. 加载模型
     # ==========================================
     print("🧠 正在加载模型权重...")
     model = AutoModelForCausalLM.from_pretrained(
         model_path,
-        dtype=torch.bfloat16,               # ✅ 修复警告：将 torch_dtype 改为 dtype
-        attn_implementation="sdpa",         # 使用 PyTorch 原生加速，无需配置 flash-attn
-        device_map="cuda"                   # 自动映射到当前 GPU
+        torch_dtype=torch.bfloat16,
+        attn_implementation="sdpa",
+        device_map="cuda"
     )
 
     # ==========================================
-    # 4. 配置训练参数 (Training Arguments)
+    # 3. LoRA 配置
     # ==========================================
-    # SFTConfig 继承自 TrainingArguments，专门针对微调优化
+    peft_config = LoraConfig(
+        task_type=TaskType.CAUSAL_LM,
+        r=64,
+        lora_alpha=128,
+        lora_dropout=0.05,
+        target_modules=["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"],
+    )
+
+    # ==========================================
+    # 4. 配置训练参数
+    # ==========================================
     training_args = SFTConfig(
         output_dir=output_dir,
-        
-        # 批次与显存控制 (2 * 8 = 16 的等效 Batch Size)
-        per_device_train_batch_size=2,
-        per_device_eval_batch_size=2,
+        per_device_train_batch_size=4,
         gradient_accumulation_steps=8,
-        gradient_checkpointing=True,        # 极限省显存魔法
-        
-        # 学习率与步数
-        learning_rate=2e-5,                 # 全量微调学习率要低
+        learning_rate=5e-5,
         lr_scheduler_type="cosine",
-        warmup_steps=100,                   # ✅ 修复警告：将 warmup_ratio 改为具体的 warmup_steps
-        num_train_epochs=3,                 # 训练 3 个 Epoch
-
-        optim="adamw_8bit",                 # ✅ 8-bit AdamW 优化器：将优化器显存从 18GB 压到 4.5GB
+        warmup_ratio=0.1,               # 🔄 修改：放弃绝对步数(100)，改用 10% 比例更科学
+        num_train_epochs=1,             # ⏬ 核心降低：4.7万条纯算法数据看1遍足够，看2遍绝对过拟合！
+        optim="adamw_8bit",
+        max_length=2048,
         
-        # 序列长度
-        max_length=2048,                # ✅ 修正：trl 中指定输入截断长度的正确参数名是 max_seq_length
-        
-        # 评估与保存策略
+        # 记录与保存设置
+        logging_steps=10,             
         eval_strategy="steps",
-        eval_steps=500,
+        eval_steps=100,                 # 整个训练总计约 742 步，每 100 步评估刚好能打出 7 个点，曲线漂亮
         save_strategy="steps",
-        save_steps=500,
-        save_total_limit=3,                 # ✅ 磁盘防爆盾：永远只保留最新的 2 个存档，旧的会自动覆盖
-        logging_steps=10,
-        
-        # 精度设置
-        bf16=True,                          # 确认开启 bfloat16
+        save_steps=200,                 # 🔽 降低：多存几个档（大概能存 3-4 个 checkpoints）
+        save_total_limit=3,             # 🔼 提升：多保留一个存档点，方便我们后续挑表现最好的回合
+        bf16=True,
+        report_to="none",
     )
 
     # ==========================================
     # 5. 启动 SFTTrainer
     # ==========================================
-    print("⚙️ 正在初始化 SFTTrainer...")
     trainer = SFTTrainer(
         model=model,
-        processing_class=tokenizer,         # ✅ 修复报错：新版 trl 中统一改名为了 processing_class
+        processing_class=tokenizer,
         train_dataset=dataset["train"],
         eval_dataset=dataset["test"],
         args=training_args,
+        peft_config=peft_config,
     )
 
-    print("🔥 开始训练！")
-    trainer.train()
+    print("🔥 开始训练...")
+    train_result = trainer.train()
+
+    # ==========================================
+    # 6. 提取日志并绘制 Loss 曲线
+    # ==========================================
+    print("📊 正在绘制 Loss 曲线...")
+    history = trainer.state.log_history
     
-    # 保存最终模型和 Tokenizer
-    print(f"💾 训练完成，正在保存最终权重至 {output_dir}...")
+    train_loss = [log["loss"] for log in history if "loss" in log]
+    train_steps = [log["step"] for log in history if "loss" in log]
+    
+    eval_loss = [log["eval_loss"] for log in history if "eval_loss" in log]
+    eval_steps = [log["step"] for log in history if "eval_loss" in log]
+
+    plt.figure(figsize=(10, 6))
+    plt.plot(train_steps, train_loss, label="Train Loss", color="blue", alpha=0.6)
+    if eval_loss:
+        plt.plot(eval_steps, eval_loss, label="Eval Loss", color="red", marker='o')
+    
+    plt.title("Training and Evaluation Loss Curve")
+    plt.xlabel("Steps")
+    plt.ylabel("Loss")
+    plt.legend()
+    plt.grid(True, linestyle='--', alpha=0.5)
+    
+    # 保存图片
+    plt.savefig(plot_path)
+    print(f"📈 Loss 曲线已保存至: {plot_path}")
+
+    # 保存最终结果
     trainer.save_model(output_dir)
     tokenizer.save_pretrained(output_dir)
-    print("🎉 All Done!")
+    print("🎉 任务圆满完成！")
 
 if __name__ == "__main__":
     main()

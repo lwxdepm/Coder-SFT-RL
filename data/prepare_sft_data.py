@@ -63,7 +63,6 @@ def main():
             continue
             
         # 3. 长度控制：
-        # 如果你使用 RTX 4060 (8GB显存) 跑 QLoRA，建议对文本长度做严格截断
         # 否则稍微长一点的上下文就会触发 OOM
         if len(instruction) + len(output) > 3000:
             skipped += 1
