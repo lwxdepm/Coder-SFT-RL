@@ -5,7 +5,7 @@ Code-RL is a reinforcement learning framework for training code generation model
 ## Features
 
 - **Execution-based Rewards**: Uses sandboxed code execution (Firejail/subprocess) to compute pass rates as rewards
-- **VERL Integration**: Compatible with VERL framework for efficient RL training
+- **Production-Grade Reward Manager**: Optimized reward computation with process pool management, warmup, and smart batch scheduling
 - **Dataset Support**: Supports multiple datasets including RLVR Code Data Python, HumanEval+, MBPP+
 - **Parallel Execution**: Batch reward computation with parallel processing
 - **Interactive Demo**: Gradio-based interface for comparing base vs trained models
@@ -21,21 +21,12 @@ code-r1/
 ├── example_usage.py            # Example usage of core components
 ├── run_training.sh             # Training script
 │
-├── reward/                     # Reward computation module
+├── reward/                     # Reward computation module (Production-Grade)
 │   ├── __init__.py
+│   ├── reward_func.py         # Main reward manager (GRPO reward computation)
 │   ├── executor.py            # Code executor with sandbox
 │   ├── metrics.py             # Evaluation metrics
 │   └── sandbox.py             # Sandbox implementations
-│
-├── verl_integration/          # VERL integration
-│   ├── __init__.py
-│   ├── data_loader/           # Data loading for VERL
-│   │   ├── __init__.py
-│   │   └── code_rl_dataset.py
-│   └── reward_manager/        # Reward managers for VERL
-│       ├── __init__.py
-│       ├── micro_grpo_reward.py  # Main reward manager
-│       └── code_executor_reward.py
 │
 ├── compare_generate/          # Model comparison UI
 │   ├── app.py                 # Gradio interface
@@ -121,24 +112,24 @@ Open `http://localhost:7860` to compare base model (Qwen2.5-Coder-1.5B-Instruct)
 
 ### Reward Computation
 
-The core reward computation is implemented in `verl_integration/reward_manager/micro_grpo_reward.py`:
+The core reward computation is implemented in `reward/reward_func.py`:
 
 ```python
-from verl_integration.reward_manager.micro_grpo_reward import get_reward_manager
+from reward.reward_func import get_reward_manager, compute_score
 
+# Using the reward manager directly
 manager = get_reward_manager()
 code = "def add(a, b): return a + b"
 tests = ["assert add(1, 2) == 3", "assert add(-1, 1) == 0"]
 result = manager.compute_reward(code, tests)
 print(f"Reward: {result['reward']}, Passed: {result['passed']}/{result['total']}")
+
+# Or using the VERL-compatible compute_score function
+result = compute_score(
+    solution_str="def add(a, b): return a + b",
+    extra_info={"tests": ["assert add(1, 2) == 3"]}
+)
 ```
-
-### VERL Integration
-
-The project provides VERL-compatible reward functions:
-
-- `compute_score()`: Single sample interface
-- `compute_score_batch()`: Batch interface with parallel execution
 
 ### Model Evaluation
 
@@ -152,13 +143,22 @@ python eval/evaluate.py --model_path Qwen/Qwen2.5-Coder-1.5B-Instruct --benchmar
 
 ### Sandbox Settings
 
-By default, the system tries to use Firejail for secure code execution. If Firejail is not available, it falls back to subprocess execution. Configure in `micro_grpo_reward.py`:
+By default, the system tries to use Firejail for secure code execution. If Firejail is not available, it falls back to subprocess execution. Configure in `reward/reward_func.py`:
 
 ```python
+from reward.reward_func import CodeRewardManager
+
 manager = CodeRewardManager(
     sandbox_type="firejail",  # or "subprocess"
     timeout=5.0,
-    max_workers=None  # Uses CPU cores - 1
+    max_workers=None,  # Uses CPU cores - 1
+    parallel_threshold=20,
+    reward_config={  # Optional reward configuration
+        'format_penalty': -1.5,
+        'syntax_error_penalty': -1.0,
+        'pass_rate_weight': 2.0,
+        'full_pass_bonus': 1.0,
+    }
 )
 ```
 
@@ -169,13 +169,13 @@ Rewards are scaled to range [-0.5, 1.0] where:
 - 0.0: No tests provided, valid syntax
 - 1.0: All tests passed
 
-## Training with VERL
+## Training
 
-The project is designed to work with VERL. Typical training workflow:
+The project uses execution-based rewards for RL training. Typical training workflow:
 
-1. **Prepare dataset** in VERL-compatible format
-2. **Configure reward function** to use `compute_score_batch`
-3. **Run VERL training** with appropriate hyperparameters
+1. **Prepare dataset** in parquet format with prompt and test columns
+2. **Configure reward function** using `reward/reward_func.py`
+3. **Run training** with VERL and appropriate hyperparameters
 
 Example training script (`run_training.sh`):
 ```bash
@@ -239,7 +239,7 @@ python -m verl.trainer.main_ppo \
     \
     actor_rollout_ref.ref.log_prob_micro_batch_size_per_gpu=8 \
     \
-    custom_reward_function.path=verl_integration/reward_manager/micro_grpo_reward.py \
+    custom_reward_function.path=reward/reward_func.py \
     custom_reward_function.name=compute_score \
     \
     reward_model.enable=false \
