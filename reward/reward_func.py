@@ -9,6 +9,8 @@ import re
 import random
 import json
 import ast
+import time
+import traceback
 from typing import List, Dict, Any, Tuple
 from concurrent.futures import ProcessPoolExecutor
 import multiprocessing as mp
@@ -44,22 +46,32 @@ def _create_default_result():
     return {
         # VERL 框架必需
         'reward': 0.0,
-        
-        # 我们的指标
+
+        # 正确性指标
         'score': 0.0,
         'pass_rate': 0.0,
         'passed': 0.0,
         'total': 0.0,
         'acc': 0.0,
-        
-        # 状态标志
-        'syntax_valid': False,
-        'has_code': False,
-        'compile_valid': False,
+
+        # 代码格式与验证阶段
+        'has_code': 0.0,
+        'syntax_valid': 0.0,
+        'compile_valid': 0.0,
+        'format_error': 0.0,
+        'syntax_error': 0.0,
+        'compile_error': 0.0,
+
+        # 运行时问题
         'timeout_count': 0.0,
-        
-        # 详细信息（必须有，即使为空）
-        'details': {},
+        'runtime_error_count': 0.0,
+
+        # 代码特征（供 W&B 监控退化和分布）
+        'code_length': 0.0,
+        'is_markdown': 0.0,
+
+        # 性能指标
+        'execution_time': 0.0,
     }
 
 
@@ -96,73 +108,85 @@ class RewardShaper:
         }
     
     def shape_reward(self, code: str, syntax_valid: bool, compile_valid: bool,
-                 execution_results: List[Dict[str, Any]], tests_count: int) -> Dict[str, Any]:
+                 execution_results: List[Dict[str, Any]], tests_count: int,
+                 code_length: int = 0, is_markdown: bool = False) -> Dict[str, Any]:
         cfg = self.config
         details = {}
-        
+
         base_result = {
             'reward': 0.0,
-            'has_code': False,
-            'syntax_valid': False,
-            'compile_valid': False,
+            'has_code': 0.0,
+            'syntax_valid': 0.0,
+            'compile_valid': 0.0,
             'pass_rate': 0.0,
             'passed': 0.0,
             'total': float(tests_count),
             'acc': 0.0,
             'timeout_count': 0.0,
-            'details': details
+            'runtime_error_count': 0.0,
+            'code_length': float(code_length),
+            'is_markdown': 1.0 if is_markdown else 0.0,
         }
-        
+
         # 1. Format / Empty Check
         if not code or not code.strip():
             details['reason'] = 'format_or_empty_error'
             base_result['reward'] = cfg['format_penalty']
-            base_result['has_code'] = False
+            base_result['has_code'] = 0.0
+            base_result['format_error'] = 1.0
+            base_result['syntax_error'] = 0.0
+            base_result['compile_error'] = 0.0
             return base_result
-            
-        base_result['has_code'] = True
-        
+
+        base_result['has_code'] = 1.0
+        base_result['format_error'] = 0.0
+
         # 2. Syntax Error
         if not syntax_valid:
             details['reason'] = 'syntax_error'
             base_result['reward'] = cfg['syntax_error_penalty']
-            base_result['syntax_valid'] = False
+            base_result['syntax_valid'] = 0.0
+            base_result['syntax_error'] = 1.0
+            base_result['compile_error'] = 0.0
             return base_result
-            
-        base_result['syntax_valid'] = True
-        
+
+        base_result['syntax_valid'] = 1.0
+        base_result['syntax_error'] = 0.0
+
         # 3. Compile Error
         if not compile_valid:
             details['reason'] = 'compile_error'
             base_result['reward'] = cfg['compile_error_penalty']
-            base_result['compile_valid'] = False
+            base_result['compile_valid'] = 0.0
+            base_result['compile_error'] = 1.0
             return base_result
-            
-        base_result['compile_valid'] = True
-        
+
+        base_result['compile_valid'] = 1.0
+        base_result['compile_error'] = 0.0
+
         # 4. Execution Check
         if not execution_results or tests_count == 0:
             details['reason'] = 'no_tests'
-            base_result['reward'] = cfg['execution_base_reward'] + 0.2 # 有代码没测试送点辛苦分
+            base_result['reward'] = cfg['execution_base_reward'] + 0.2
             base_result['total'] = 0.0
             return base_result
-            
+
         # 统计执行结果
         passed = 0
         runtime_errors = 0
         timeouts = 0
-        
+
         for result in execution_results:
             status = result.get('status', 'error')
             if status == 'success': passed += 1
             elif status == 'timeout': timeouts += 1
             elif status in ('error', 'runtime_error'): runtime_errors += 1
-                
+
         pass_rate = passed / tests_count if tests_count > 0 else 0.0
-        
+
         # --- 计算最终奖励 ---
         reward = cfg['execution_base_reward']
-        
+
         # 惩罚项（保证扣除后依然严格大于 compile_error_penalty）
         if timeouts > 0:
             reward += cfg['timeout_penalty']
@@ -172,17 +196,16 @@ class RewardShaper:
             details['reason'] = 'runtime_error'
         elif passed == 0:
             details['reason'] = 'zero_pass'
-            # 不扣分，保持 0.0，只要代码能跑完没报错，0通过也值得鼓励！
-        
+
         # 奖励项
         if passed > 0:
             reward += pass_rate * cfg['pass_rate_weight']
             details['reason'] = 'partial_pass'
-            
+
         if passed == tests_count and tests_count > 0:
             reward += cfg['full_pass_bonus']
             details['reason'] = 'full_pass'
-            
+
         base_result.update({
             'reward': reward,
             'pass_rate': pass_rate,
@@ -190,14 +213,15 @@ class RewardShaper:
             'total': float(tests_count),
             'acc': 1.0 if passed == tests_count and tests_count > 0 else 0.0,
             'timeout_count': float(timeouts),
+            'runtime_error_count': float(runtime_errors),
         })
-        
+
         return base_result
 
 
 class CodeValidator:
     """代码验证器 - 检查语法和编译"""
-    
+
     @staticmethod
     def check_syntax(code: str) -> Tuple[bool, str]:
         if not code or not code.strip():
@@ -209,7 +233,7 @@ class CodeValidator:
             return False, f"Syntax error: {e}"
         except Exception as e:
             return False, f"Parse error: {e}"
-    
+
     @staticmethod
     def check_compile(code: str) -> Tuple[bool, str]:
         if not code or not code.strip():
@@ -221,7 +245,7 @@ class CodeValidator:
             return False, f"Compile error (syntax): {e}"
         except Exception as e:
             return False, f"Compile error: {e}"
-    
+
     @staticmethod
     def validate_code(code: str) -> Dict[str, Any]:
         result = {
@@ -233,19 +257,30 @@ class CodeValidator:
         }
         if not result['has_code']:
             return result
-        
+
         syntax_valid, syntax_error = CodeValidator.check_syntax(code)
         result['syntax_valid'] = syntax_valid
         result['syntax_error'] = syntax_error
-        
+
         if not syntax_valid:
             return result
-        
+
         compile_valid, compile_error = CodeValidator.check_compile(code)
         result['compile_valid'] = compile_valid
         result['compile_error'] = compile_error
-        
+
         return result
+
+    @staticmethod
+    def extract_reason(validation: Dict[str, Any]) -> str:
+        """从验证结果提取失败原因"""
+        if not validation.get('has_code'):
+            return 'empty_or_format'
+        if not validation.get('syntax_valid'):
+            return 'syntax'
+        if not validation.get('compile_valid'):
+            return 'compile'
+        return 'none'
 
 
 class CodeRewardManager:
@@ -304,55 +339,59 @@ class CodeRewardManager:
     def compute_reward(self, code: str, tests: list) -> dict:
         self.stats['total_samples'] += 1
         result = _create_default_result()
-        
+
+        start_time = time.time()
         validation = self.validator.validate_code(code)
-        
+
+        code_length = len(code) if code else 0
+        result['code_length'] = float(code_length)
+
         if not validation['has_code']:
             self.stats['empty_samples'] += 1
-            # 统一使用 'format_penalty'
             result['reward'] = self.shaper.config['format_penalty']
             result['score'] = self.shaper.config['format_penalty']
-            result['has_code'] = False
-            result['details'] = {'reason': 'empty_or_format_error'}
-            if self.verbose and random.random() < 0.1:
-                print(f"[REWARD] Empty/Format error: score={result['score']:.2f}")
+            result['has_code'] = 0.0
+            result['format_error'] = 1.0
+            result['execution_time'] = time.time() - start_time
             return result
-        
+
         if not validation['syntax_valid']:
             self.stats['syntax_errors'] += 1
             shaped = self.shaper.shape_reward(
                 code=code, syntax_valid=False, compile_valid=False,
-                execution_results=[], tests_count=len(tests) if tests else 0
+                execution_results=[], tests_count=len(tests) if tests else 0,
+                code_length=code_length
             )
             result.update(shaped)
             result['score'] = shaped['reward']
-            if self.verbose and random.random() < 0.1:
-                print(f"[REWARD] Syntax error: score={result['score']:.2f}")
+            result['syntax_error'] = 1.0
+            result['execution_time'] = time.time() - start_time
             return result
-        
+
         if not validation['compile_valid']:
             self.stats['compile_errors'] += 1
             shaped = self.shaper.shape_reward(
                 code=code, syntax_valid=True, compile_valid=False,
-                execution_results=[], tests_count=len(tests) if tests else 0
+                execution_results=[], tests_count=len(tests) if tests else 0,
+                code_length=code_length
             )
             result.update(shaped)
             result['score'] = shaped['reward']
-            if self.verbose and random.random() < 0.1:
-                print(f"[REWARD] Compile error: score={result['score']:.2f}")
+            result['compile_error'] = 1.0
+            result['execution_time'] = time.time() - start_time
             return result
-        
+
         if not tests:
             shaped = self.shaper.shape_reward(
                 code=code, syntax_valid=True, compile_valid=True,
-                execution_results=[], tests_count=0
+                execution_results=[], tests_count=0,
+                code_length=code_length
             )
             result.update(shaped)
             result['score'] = shaped['reward']
-            if self.verbose and random.random() < 0.1:
-                print(f"[REWARD] No tests: score={result['score']:.2f}")
+            result['execution_time'] = time.time() - start_time
             return result
-        
+
         execution_results = []
         for test in tests:
             try:
@@ -360,23 +399,24 @@ class CodeRewardManager:
                 execution_results.append(exec_result)
             except Exception as e:
                 execution_results.append({'status': 'error', 'message': str(e)})
-        
+
         shaped = self.shaper.shape_reward(
             code=code, syntax_valid=True, compile_valid=True,
-            execution_results=execution_results, tests_count=len(tests)
+            execution_results=execution_results, tests_count=len(tests),
+            code_length=code_length
         )
-        
+
         if shaped.get('acc', 0.0) == 1.0:
             self.stats['full_pass'] += 1
-        
+
         result.update(shaped)
         result['score'] = shaped['reward']
-        details = shaped.get('details', {})
+        result['execution_time'] = time.time() - start_time
 
         if self.verbose and random.random() < 0.1:
             print(f"[REWARD] score={result['score']:.2f} | "
                 f"pass={int(shaped.get('passed', 0))}/{int(shaped.get('total', 0))} | "
-                f"reason={details.get('reason', 'N/A')}")
+                f"code_len={code_length}")
 
         if self.verbose and (self.stats['total_samples'] <= 20 or random.random() < 0.02):
             print(f"\n{'='*80}")
@@ -401,11 +441,11 @@ class CodeRewardManager:
     def compute_reward_batch_parallel(self, codes: List[str], tests_list: List[list]) -> List[dict]:
         if len(codes) != len(tests_list):
             raise ValueError("codes and tests_list must have the same length")
-        
+
         all_pairs = []
         pair_to_sample = []
         sample_validations = []
-        
+
         for idx, (code, tests) in enumerate(zip(codes, tests_list)):
             validation = self.validator.validate_code(code)
             sample_validations.append(validation)
@@ -414,7 +454,7 @@ class CodeRewardManager:
                     for test_idx, test in enumerate(tests):
                         all_pairs.append((code, test, self.sandbox_type, self.timeout))
                         pair_to_sample.append((idx, test_idx))
-        
+
         if not all_pairs:
             batch_results = []
         else:
@@ -423,57 +463,63 @@ class CodeRewardManager:
             else:
                 with ProcessPoolExecutor(max_workers=self.max_workers) as executor:
                     batch_results = list(executor.map(_execute_single_pair, all_pairs))
-        
+
         results = []
         pair_idx = 0
-        
+
         for sample_idx, (code, tests) in enumerate(zip(codes, tests_list)):
             validation = sample_validations[sample_idx]
             result = _create_default_result()
-            
+            result['code_length'] = float(len(code)) if code else 0.0
+
             if not validation['has_code']:
                 result['reward'] = self.shaper.config['format_penalty']
                 result['score'] = self.shaper.config['format_penalty']
-                result['has_code'] = False
-                result['details'] = {'reason': 'empty_or_format_error'}
+                result['has_code'] = 0.0
+                result['format_error'] = 1.0
                 results.append(result)
                 continue
-            
+
             if not validation['syntax_valid']:
                 shaped = self.shaper.shape_reward(
                     code=code, syntax_valid=False, compile_valid=False,
-                    execution_results=[], tests_count=len(tests) if tests else 0
+                    execution_results=[], tests_count=len(tests) if tests else 0,
+                    code_length=result['code_length']
                 )
                 result.update(shaped)
                 result['score'] = shaped['reward']
+                result['syntax_error'] = 1.0
                 results.append(result)
                 continue
-            
+
             if not validation['compile_valid']:
                 shaped = self.shaper.shape_reward(
                     code=code, syntax_valid=True, compile_valid=False,
-                    execution_results=[], tests_count=len(tests) if tests else 0
+                    execution_results=[], tests_count=len(tests) if tests else 0,
+                    code_length=result['code_length']
                 )
                 result.update(shaped)
                 result['score'] = shaped['reward']
+                result['compile_error'] = 1.0
                 results.append(result)
                 continue
-            
+
             execution_results = []
             if tests:
                 for _ in range(len(tests)):
                     if pair_idx < len(batch_results):
                         execution_results.append(batch_results[pair_idx])
                         pair_idx += 1
-            
+
             shaped = self.shaper.shape_reward(
                 code=code, syntax_valid=True, compile_valid=True,
-                execution_results=execution_results, tests_count=len(tests) if tests else 0
+                execution_results=execution_results, tests_count=len(tests) if tests else 0,
+                code_length=result['code_length']
             )
             result.update(shaped)
             result['score'] = shaped['reward']
             results.append(result)
-        
+
         return results
     
     def compute_reward_batch(self, codes: List[str], tests_list: List[list], use_parallel: bool = True) -> List[dict]:
@@ -522,9 +568,18 @@ def _parse_tests(ground_truth):
     """
     鲁棒的测试用例解析器
     彻底防范由于 Numpy 强制转换为 String (缺少逗号) 导致的静默全通(Silent Pass) Bug
+
+    修复: 处理 pandas Series/DataFrame 等 parquet 读取后的类型
     """
     if ground_truth is None:
         return []
+
+    # pandas Series / DataFrame: 转为 list
+    type_name = type(ground_truth).__name__
+    if type_name in ('Series',):
+        ground_truth = ground_truth.tolist()
+    elif type_name in ('DataFrame',):
+        ground_truth = ground_truth.to_dict('records')
 
     if isinstance(ground_truth, np.ndarray):
         ground_truth = ground_truth.tolist()
@@ -534,9 +589,9 @@ def _parse_tests(ground_truth):
         ground_truth = ground_truth.strip()
         if not ground_truth:
             return []
-            
+
         parsed = False
-        
+
         # 1. 尝试标准 JSON 解析
         try:
             ground_truth = json.loads(ground_truth)
@@ -555,24 +610,22 @@ def _parse_tests(ground_truth):
         # 3. 核心防御：处理由于缺失逗号等原因导致解析失败的 Numpy Stringified Array
         if not parsed and ground_truth.startswith('[') and ground_truth.endswith(']'):
             try:
-                # 使用 ast.parse 安全地提取里面所有长得像字符串的节点
                 tree = ast.parse(ground_truth)
                 extracted = []
                 for node in ast.walk(tree):
                     if isinstance(node, ast.Constant) and isinstance(node.value, str):
                         extracted.append(node.value)
-                    elif type(node).__name__ == 'Str':  # 兼容低版本 Python
+                    elif type(node).__name__ == 'Str':
                         extracted.append(node.s)
-                
+
                 if extracted:
                     ground_truth = extracted
                     parsed = True
                 else:
-                    # 语法损坏彻底，坚决返回无测试用例，触发低保分(0.2)并中断静默满分
                     return []
             except Exception:
-                return [] 
-        
+                return []
+
         # 4. 如果所有解析都失败且不是列表表现形式，那就默认它是纯原生 Python 代码片段
         if not parsed and isinstance(ground_truth, str):
             ground_truth = [ground_truth]
@@ -598,7 +651,6 @@ def _parse_tests(ground_truth):
 
     _flatten(ground_truth)
 
-    # 清洗：防止提取出空的、只包含换行符的僵尸字符串再次导致静默通过
     return [t.strip() for t in tests if t and t.strip()]
 
 
@@ -606,28 +658,46 @@ def compute_score(data_source=None, solution_str=None, ground_truth=None,
                   extra_info=None, **kwargs):
     """
     VERL 单样本接口（Production 版本）
-    
+
     完整的防崩溃机制：
     1. Anti-format-error reward (强制 markdown)
     2. Strict Monotonic Syntax shaping
     3. Compile shaping
     4. Execution shaping
     5. Anti-Silent-Pass (AST 级解析器)
+    6. 顶层 try/except 防护 Ray worker 崩溃
     """
-    manager = get_reward_manager()
-    
-    code = manager.extract_code(solution_str) if solution_str else ""
-    tests = _parse_tests(extra_info.get("tests", "")) if extra_info else []
-    
-    result = manager.compute_reward(code, tests)
-    
-    if random.randint(1, 100) == 1:
-        stats = manager.get_stats()
-        print(f"\n[REWARD STATS] "
-              f"total={stats['total_samples']} "
-              f"format_err={stats['empty_rate']:.2%} "
-              f"syntax_err={stats['syntax_error_rate']:.2%} "
-              f"compile_err={stats['compile_error_rate']:.2%} "
-              f"full_pass={stats['full_pass_rate']:.2%}")
-    
-    return result
+    try:
+        manager = get_reward_manager()
+
+        code = manager.extract_code(solution_str) if solution_str else ""
+
+        # 从 extra_info 中提取 tests
+        tests = []
+        if extra_info is not None:
+            try:
+                tests = _parse_tests(extra_info.get("tests", ""))
+            except Exception:
+                tests = []
+
+        result = manager.compute_reward(code, tests)
+
+        if random.randint(1, 100) == 1:
+            stats = manager.get_stats()
+            print(f"\n[REWARD STATS] "
+                  f"total={stats['total_samples']} "
+                  f"format_err={stats['empty_rate']:.2%} "
+                  f"syntax_err={stats['syntax_error_rate']:.2%} "
+                  f"compile_err={stats['compile_error_rate']:.2%} "
+                  f"full_pass={stats['full_pass_rate']:.2%}")
+
+        return result
+
+    except Exception as e:
+        # 关键修复: 任何异常都返回默认结果，防止 Ray worker 崩溃导致训练终止
+        print(f"[REWARD ERROR] compute_score crashed: {e}")
+        traceback.print_exc()
+        default = _create_default_result()
+        default['reward'] = -2.0  # 给予严重惩罚
+        default['score'] = -2.0
+        return default

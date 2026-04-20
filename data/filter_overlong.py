@@ -2,6 +2,8 @@ import pandas as pd
 from transformers import AutoTokenizer
 
 
+import os
+
 def filter_long_samples(
     parquet_path: str,
     tokenizer_path: str,
@@ -47,11 +49,23 @@ def filter_long_samples(
 
     df_filtered = df_filtered.drop(columns=["token_len"])
 
+    # 关键修复: 禁止原地覆写，防止写入过程中崩溃导致数据丢失
     if output_path is None:
         output_path = parquet_path
 
-    print("Saving to:", output_path)
-    df_filtered.to_parquet(output_path)
+    # 如果输入输出路径相同，先写入临时文件再替换
+    abs_input = os.path.abspath(parquet_path)
+    abs_output = os.path.abspath(output_path)
+    if abs_input == abs_output:
+        tmp_path = abs_input + ".tmp_filtered"
+        print("Saving to temp file:", tmp_path)
+        df_filtered.to_parquet(tmp_path)
+        # 原子替换
+        os.replace(tmp_path, abs_input)
+        print("Replaced original file:", abs_input)
+    else:
+        print("Saving to:", output_path)
+        df_filtered.to_parquet(output_path)
 
     return df_filtered
 filter_long_samples(

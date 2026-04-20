@@ -11,7 +11,7 @@ from tqdm import tqdm
 from rich.console import Console
 from rich.table import Table
 
-from reward.executor import CodeExecutor, BatchExecutor
+from reward.executor import CodeExecutor
 
 console = Console()
 
@@ -32,7 +32,7 @@ def evaluate_on_dataset(
     import torch
 
     results = []
-    batch_executor = BatchExecutor(executor, n_workers=16)
+    batch_executor = CodeExecutor(sandbox_type="subprocess", timeout=5.0)
 
     for sample in tqdm(dataset, desc="Evaluating"):
         prompt = sample["prompt"]
@@ -111,7 +111,7 @@ def main():
     )
     model.eval()
 
-    executor = CodeExecutor(sandbox="subprocess", timeout=5.0)
+    executor = CodeExecutor(sandbox_type="subprocess", timeout=5.0)
 
     all_results = {}
 

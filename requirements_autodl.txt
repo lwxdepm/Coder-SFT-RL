@@ -1,0 +1,38 @@
+# Code-RL 适配 AutoDL 环境 (PyTorch 2.7.0 + CUDA 12.8 + Python 3.12)
+# 所有版本精确锁定，避免自动升级到不兼容版本
+
+# Core (精确版本)
+torch==2.7.0
+vllm==0.9.1
+flash-attn>=2.7.0
+
+# VERL (从 GitHub 安装最新版，已支持 vLLM >= 0.8)
+verl @ git+https://github.com/volcengine/verl.git
+
+# Transformers (vLLM 0.9.x 兼容范围)
+transformers>=4.40.0,<4.50.0
+
+# Data
+datasets>=2.18.0
+huggingface_hub
+pandas
+numpy
+
+# Observability
+wandb
+rich
+tensorboard
+
+# Utilities
+matplotlib
+seaborn
+tqdm
+pydantic
+python-Levenshtein>=0.25.0
+
+# Model export & testing
+peft
+safetensors
+
+# UI comparison
+gradio
